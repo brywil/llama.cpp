@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Callable, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,8 +13,23 @@ from .base import MmprojModel, ModelBase, TextModel, gguf, logger
 class InklingModel(TextModel):
     model_arch = gguf.MODEL_ARCH.INKLING
     undo_permute = False
+    supports_mtp_export = True
 
-    _SKIP_PREFIXES = ("model.visual.", "model.audio.", "model.mtp.")
+    # model.mtp.* is NOT skipped -- it is remapped onto blk.{n_layer + k}; see filter_tensors
+    _SKIP_PREFIXES = ("model.visual.", "model.audio.")
+
+    # set on the class in __init__ so the filter_tensors classmethod can see them
+    # (same pattern as Cohere2MoeModel._n_main_layers)
+    _n_main_layers: int | None = None
+    _n_mtp: int = 0
+
+    _MTP_RE = re.compile(r"^model\.mtp\.layers\.(\d+)\.(.*)$")
+    # the three head-specific tensors; everything else in a head is an ordinary dense block
+    _MTP_EXTRAS = {
+        "embed_norm.weight":  "mtp_enorm.weight",
+        "hidden_norm.weight": "mtp_hnorm.weight",
+        "input_proj.weight":  "mtp_eh_proj.weight",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -65,10 +81,29 @@ class InklingModel(TextModel):
         # checked by the base find_hparam list before the MoE "intermediate_size"
         self.hparams["prefix_dense_intermediate_size"] = hp["dense_intermediate_size"]
 
+        # MTP: 8 chained heads, one per draft step, exported as blocks n_layer..n_layer+7.
+        n_layer = hp["num_hidden_layers"]
+        n_mtp = int((hp.get("mtp_config") or {}).get("num_nextn_predict_layers", 0) or 0)
+        if self.no_mtp:
+            n_mtp = 0
+        self._n_mtp = n_mtp
+        type(self)._n_main_layers = n_layer
+        type(self)._n_mtp = n_mtp
+        if n_mtp:
+            # llama.cpp derives the trunk as n_layer() = n_layer_all - n_layer_nextn, so
+            # block_count must cover the heads. tensor_map is built from block_count in
+            # ModelBase.__init__ and MUST be rebuilt, or blk.>=n_layer names never resolve.
+            self.block_count = n_layer + n_mtp
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        # full length (n_layer_all) -- the swa pattern describes the MTP heads too
         self._local_layer_flags = self._get_local_layer_flags()
+        # ...but head_count_kv is read by the GENERIC loader with n = n_layer() (the trunk), and
+        # get_key_or_arr throws on any length mismatch. So this array MUST stay trunk-length;
+        # inkling's load_arch_hparams back-fills the MTP entries instead.
         self.hparams["num_key_value_heads"] = [
             hp["swa_num_key_value_heads"] if is_local else hp["num_key_value_heads"]
-            for is_local in self._local_layer_flags
+            for is_local in self._local_layer_flags[:n_layer]
         ]
 
     def _get_local_layer_flags(self) -> list[bool]:
@@ -79,7 +114,19 @@ class InklingModel(TextModel):
             # default: global at id % 6 == 5; omitted/null must not collapse to all-global (explicit [] does)
             local_ids = [i for i in range(n_layer) if i % 6 != 5]
         local_ids = set(local_ids)
-        return [i in local_ids for i in range(n_layer)]
+        flags = [i in local_ids for i in range(n_layer)]
+
+        # The MTP heads have their OWN local/global pattern, in mtp_config.local_layer_ids --
+        # independently confirmed by attn.rel_logits_proj, which is [d_rel, 512] on a local head
+        # and [d_rel, rel_extent] on a global one. The array is written for all n_layer_all
+        # blocks, so leaving it trunk-length would silently mark every head global.
+        if self._n_mtp:
+            mtp_local = (self.hparams.get("mtp_config") or {}).get("local_layer_ids")
+            if mtp_local is None:
+                mtp_local = [k for k in range(self._n_mtp) if k % 6 != 5]
+            mtp_local = set(mtp_local)
+            flags += [k in mtp_local for k in range(self._n_mtp)]
+        return flags
 
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens, toktypes, tokpre = super().get_vocab_base()
@@ -156,6 +203,14 @@ class InklingModel(TextModel):
         self.gguf_writer.add_float32(f"{arch}.log_scaling_alpha", hp.get("log_scaling_alpha", 0.0))
         self.gguf_writer.add_uint32(f"{arch}.unpadded_vocab_size", hp["unpadded_vocab_size"])
 
+        if self._n_mtp:
+            self.gguf_writer.add_nextn_predict_layers(self._n_mtp)
+            logger.info(
+                f"gguf: (inkling) MTP heads = {self._n_mtp} at blk."
+                f"{hp['num_hidden_layers']}..{hp['num_hidden_layers'] + self._n_mtp - 1}"
+                f", block_count = {self.block_count}"
+            )
+
         logger.info(f"gguf: (inkling) swa pattern (true=local) = {self._local_layer_flags}")
         logger.info(f"gguf: (inkling) unpadded_vocab_size = {hp['unpadded_vocab_size']}")
 
@@ -166,7 +221,32 @@ class InklingModel(TextModel):
         if name.startswith(cls._SKIP_PREFIXES):
             return None
 
-        name = name.replace("model.llm.", "model.")
+        if (m := cls._MTP_RE.match(name)) is not None:
+            # Each MTP head is enorm/hnorm/input_proj plus a full DENSE transformer_block. Remap
+            # the block onto the trunk's own layer names at bid = n_layer + k so every existing
+            # attn / sconv / dense-FFN rule applies unchanged, and give the three head-specific
+            # tensors sentinel names that modify_tensors turns into blk.{bid}.nextn.*.
+            if cls.no_mtp or not cls._n_mtp or cls._n_main_layers is None:
+                return None
+            k, tail = int(m.group(1)), m.group(2)
+            if k >= cls._n_mtp:
+                raise ValueError(
+                    f"MTP head {k} exceeds mtp_config.num_nextn_predict_layers={cls._n_mtp} ({name!r})"
+                )
+            bid = cls._n_main_layers + k
+            if tail.startswith("transformer_block."):
+                name = f"model.layers.{bid}." + tail.removeprefix("transformer_block.")
+            elif (sentinel := cls._MTP_EXTRAS.get(tail)) is not None:
+                name = f"model.layers.{bid}.{sentinel}"
+            else:
+                # loud, not silent: an unrecognised head tensor would otherwise be dropped and
+                # the drafter would load with a missing weight
+                raise ValueError(f"unexpected Inkling MTP tensor {name!r}")
+        elif cls.mtp_only:
+            return None
+        else:
+            name = name.replace("model.llm.", "model.")
+
         # parameter has no ".weight"-style suffix in the checkpoint
         name = name.replace("rel_logits_proj.proj", "rel_logits_proj.weight")
 
@@ -179,7 +259,21 @@ class InklingModel(TextModel):
         up   = w13[..., 1::2, :].contiguous()
         return gate, up
 
+    # sentinel suffix (from filter_tensors) -> ggml nextn tensor
+    _MTP_SENTINELS = {
+        "mtp_enorm.weight":   gguf.MODEL_TENSOR.NEXTN_ENORM,
+        "mtp_hnorm.weight":   gguf.MODEL_TENSOR.NEXTN_HNORM,
+        "mtp_eh_proj.weight": gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+    }
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # MTP head extras. Checked before the generic rules because these names are synthetic and
+        # map_tensor_name would not know them.
+        for suffix, tensor in self._MTP_SENTINELS.items():
+            if name.endswith(suffix):
+                assert bid is not None
+                return [(self.format_tensor_name(tensor, bid), data_torch)]
+
         # short convs: [C, 1, K] -> [C, K] (same layout as LFM2 shortconv.conv)
         if name.endswith("_sconv.weight"):
             data_torch = data_torch.squeeze(1)

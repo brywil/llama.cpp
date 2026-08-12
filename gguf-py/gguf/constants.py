@@ -4448,6 +4448,14 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
+        # MTP: 8 chained heads at blk.{n_layer + k}. Each head is enorm/hnorm/eh_proj plus a
+        # full DENSE transformer block, so it reuses the ATTN_*/SHORTCONV_*/FFN_{GATE,UP,DOWN}
+        # entries above. Inkling's heads share the trunk embed/unembed, so there is no
+        # NEXTN_EMBED_TOKENS / NEXTN_SHARED_HEAD_* (both TENSOR_NOT_REQUIRED on the C++ side,
+        # which falls back to model.tok_embd).
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
     ],
     MODEL_ARCH.SMALLTHINKER: [
         MODEL_TENSOR.TOKEN_EMBD,

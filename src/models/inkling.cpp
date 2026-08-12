@@ -17,10 +17,32 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,         hparams.expert_gating_func, false);
 
+    // MTP: n_layer_nextn chained draft heads live at blk.{n_layer()..n_layer_all-1}. Read this
+    // FIRST -- n_layer() is n_layer_all - n_layer_nextn, so every trunk-length read below
+    // depends on it.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
+
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // visible iff pos_q - pos_k < n_swa (includes self)
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
+    // n_layer_all, not n_layer(): the heads carry their own local/global pattern (heads 1 and 3
+    // are global in Inkling-Small). get_key_or_arr throws on a length mismatch, and with no MTP
+    // n_layer_all == n_layer() so this stays compatible with an MTP-less export.
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
 
+    // The generic loader fills these only up to n_layer() and zero-fills the rest, but n_ff(il)
+    // and n_head_kv(il) are legal for any il < n_layer_all -- so an MTP block would silently get
+    // 0-sized FFN/attention tensors. Back-fill from the trunk: every head is an ordinary DENSE
+    // block with the same width and head counts as layer 0.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.n_ff_arr[il]      = hparams.n_ff_arr[0];
+        hparams.n_head_arr[il]    = hparams.n_head_arr[0];
+        hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[0];
+    }
+
+    // NOTE: only trunk layers are marked recurrent. The MTP heads DO carry sconv state
+    // (k/v/attn/mlp), so whoever adds the draft graph must extend this and the recurrent cache
+    // sizing to n_layer_all; leaving it trunk-length keeps the non-drafting path byte-identical.
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         hparams.is_recr_impl[il] = 1;
     }
@@ -65,12 +87,24 @@ void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,          "weight"), {n_embd, n_vocab}, 0);
 
-    for (int i = 0; i < n_layer; ++i) {
+    // trunk layers [0, n_layer), then the n_layer_nextn MTP heads at [n_layer, n_layer_all)
+    for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
+
+        const bool is_mtp = i >= n_layer;
 
         const int64_t n_head_kv_i = hparams.n_head_kv(i);
         const int64_t kvw         = n_head_kv_i * head_dim;
         const int64_t rel_extent  = hparams.is_swa(i) ? hparams.inkling_rel_extent_swa : hparams.inkling_rel_extent;
+
+        if (is_mtp) {
+            // Each head consumes concat[embed, hidden] -> n_embd, then runs an ordinary dense
+            // block (falls through below). Inkling's heads share the trunk embed/unembed, so
+            // there is no nextn.embed_tokens / nextn.shared_head_* to load.
+            layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, 0);
+            layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {n_embd}, 0);
+            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2*n_embd, n_embd}, 0);
+        }
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
@@ -94,7 +128,9 @@ void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
         layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_FFN_NORM,   "weight", i), {n_embd}, 0);
         layer.ffn_gscale = create_tensor(tn(LLM_TENSOR_FFN_GSCALE, "weight", i), {1}, 0);
 
-        if (i < (int) hparams.n_layer_dense_lead) {
+        // MTP heads are always dense (mlp.w13_dn / mlp.w2_md in the checkpoint), regardless of
+        // where n_layer_dense_lead falls in the trunk
+        if (is_mtp || i < (int) hparams.n_layer_dense_lead) {
             const int64_t n_ff_i = hparams.n_ff(i);
 
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff_i}, 0);
