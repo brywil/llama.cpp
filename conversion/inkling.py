@@ -40,6 +40,28 @@ class InklingModel(TextModel):
         if "dense_intermediate_size" not in hp and "moe_intermediate_size" in hp:
             hp["dense_intermediate_size"] = hp["intermediate_size"]
             hp["intermediate_size"] = hp["moe_intermediate_size"]
+
+        # ...and then DISTRUST the result: measure the expert width from the tensor itself.
+        #
+        # load_hparams() goes through AutoConfig.from_pretrained().to_dict(), so we never see the
+        # raw config.json. TML names the MoE expert width `intermediate_size` (2048 here) and the
+        # dense width `dense_intermediate_size` (16384). InklingTextConfig reads the DENSE one
+        # into `intermediate_size`, drops `dense_intermediate_size` entirely, and invents
+        # `moe_intermediate_size` from its own default of 3072 -- so the branch above fires and
+        # propagates a value that is in the checkpoint nowhere.
+        #
+        # This used to work: before transformers supported Inkling, AutoConfig raised, the loader
+        # fell back to raw config.json, `dense_intermediate_size` was present and the branch was
+        # skipped. transformers 5.14 adding native Inkling support is what broke it. Left
+        # unfixed, expert_feed_forward_length ships as 3072 while the expert tensors are written
+        # at their real 2048, and llama.cpp refuses to load the result.
+        if (measured := self._measured_moe_ff()) is not None and measured != hp.get("intermediate_size"):
+            logger.warning(
+                f"expert intermediate_size {hp.get('intermediate_size')} disagrees with the "
+                f"checkpoint; using the measured {measured} "
+                f"(transformers' moe_intermediate_size default is not this checkpoint's value)"
+            )
+            hp["intermediate_size"] = measured
         if "sconv_kernel_size" not in hp and "conv_kernel_size" in hp:
             hp["sconv_kernel_size"] = hp["conv_kernel_size"]
         if "dense_mlp_idx" not in hp and hp.get("mlp_layer_types"):
@@ -105,6 +127,42 @@ class InklingModel(TextModel):
             hp["swa_num_key_value_heads"] if is_local else hp["num_key_value_heads"]
             for is_local in self._local_layer_flags[:n_layer]
         ]
+
+    def _measured_moe_ff(self) -> int | None:
+        """Routed-expert intermediate size, read from a w13 tensor header (no tensor data).
+
+        w13_weight is [n_expert, 2*I, n_embd] with gate and up interleaved, so I = dim(-2) // 2.
+        Returns None if the checkpoint cannot be inspected, in which case the config value stands.
+        """
+        import json as _json
+        import pathlib as _pl
+
+        try:
+            from safetensors import safe_open
+
+            d = _pl.Path(self.dir_model)
+            index = d / "model.safetensors.index.json"
+            if index.is_file():
+                wm = _json.loads(index.read_text())["weight_map"]
+                name = next(k for k in sorted(wm) if k.endswith(".mlp.experts.w13_weight"))
+                files = [(d / wm[name], name)]
+            else:
+                files = []
+                for f in sorted(d.glob("*.safetensors")):
+                    with safe_open(f, framework="pt") as h:
+                        hit = next((k for k in sorted(h.keys()) if k.endswith(".mlp.experts.w13_weight")), None)
+                    if hit:
+                        files = [(f, hit)]
+                        break
+            if not files:
+                return None
+            path, name = files[0]
+            with safe_open(path, framework="pt") as h:
+                shape = list(h.get_slice(name).get_shape())
+            return shape[-2] // 2
+        except Exception as e:  # never let a probe failure block a conversion
+            logger.warning(f"could not measure expert intermediate_size from the checkpoint: {e}")
+            return None
 
     def _get_local_layer_flags(self) -> list[bool]:
         # local_layer_ids is authoritative; a round-tripped layer_types may be stale and must not override it
