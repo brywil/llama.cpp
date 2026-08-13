@@ -120,13 +120,56 @@ class InklingModel(TextModel):
 
         # full length (n_layer_all) -- the swa pattern describes the MTP heads too
         self._local_layer_flags = self._get_local_layer_flags()
-        # ...but head_count_kv is read by the GENERIC loader with n = n_layer() (the trunk), and
-        # get_key_or_arr throws on any length mismatch. So this array MUST stay trunk-length;
-        # inkling's load_arch_hparams back-fills the MTP entries instead.
-        self.hparams["num_key_value_heads"] = [
-            hp["swa_num_key_value_heads"] if is_local else hp["num_key_value_heads"]
-            for is_local in self._local_layer_flags[:n_layer]
-        ]
+
+        # head_count_kv: write a SCALAR when the local and global layers agree, which sidesteps a
+        # length trap that cost a full conversion to find.
+        #
+        # The generic loader reads this key with `hparams.n_layer()`, which is
+        # n_layer_all - n_layer_nextn -- but nextn_predict_layers is read LATER, by the
+        # arch-specific hook, so at that moment n_layer_nextn is still 0 and n_layer() returns the
+        # FULL block count (50), not the trunk (42). Reading the code without tracing that ordering
+        # gives exactly the wrong answer, and get_key_or_arr throws on any mismatch:
+        #     key inkling.attention.head_count_kv has wrong array length; expected 50, got 42
+        # A scalar is broadcast to whatever length the loader asks for, so it is correct under
+        # either reading and cannot rot if that ordering changes again.
+        kv_swa, kv_glb = hp["swa_num_key_value_heads"], hp["num_key_value_heads"]
+        if kv_swa == kv_glb:
+            self.hparams["num_key_value_heads"] = kv_glb
+        else:
+            # Genuinely per-layer: emit the FULL n_layer_all length, matching what the generic
+            # loader asks for. The MTP heads reuse the trunk's global value.
+            self.hparams["num_key_value_heads"] = [
+                kv_swa if is_local else kv_glb for is_local in self._local_layer_flags
+            ]
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        """Set the MTP class attributes BEFORE any tensor is filtered.
+
+        `ModelBase.__init__` calls `index_tensors()`, which runs `filter_tensors` over every
+        tensor in the checkpoint. That happens BEFORE this subclass's `__init__` body executes,
+        so setting `_n_mtp` there is too late: the guard in `filter_tensors` sees the class
+        default of 0 and silently drops all 160 `model.mtp.*` tensors, while
+        `set_gguf_parameters` -- which runs later, with `_n_mtp` correctly 8 -- still writes
+        `nextn_predict_layers = 8` and `block_count = 50`.
+
+        The result is a GGUF that ADVERTISES 8 MTP blocks and does not contain them. Nothing
+        errors; the converter logs "MTP heads = 8 at blk.42..49" and reports success, and the
+        491 GiB file is only revealed as broken when llama.cpp refuses it with "wrong number of
+        tensors". This cost a full 72-minute conversion to discover.
+
+        `Cohere2MoeModel` sets its own `_n_main_layers` from an `index_tensors` override for
+        exactly this reason. Do not move this back into `__init__`.
+        """
+        hp = {**self.hparams, **(self.hparams.get("text_config") or {})}
+        n_layer = hp.get("num_hidden_layers")
+        n_mtp = int((hp.get("mtp_config") or {}).get("num_nextn_predict_layers", 0) or 0)
+        if self.no_mtp:
+            n_mtp = 0
+        if n_layer is not None:
+            type(self)._n_main_layers = int(n_layer)
+            type(self)._n_mtp = n_mtp
+            self._n_mtp = n_mtp
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
     def _measured_moe_ff(self) -> int | None:
         """Routed-expert intermediate size, read from a w13 tensor header (no tensor data).

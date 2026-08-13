@@ -34,10 +34,15 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
     // and n_head_kv(il) are legal for any il < n_layer_all -- so an MTP block would silently get
     // 0-sized FFN/attention tensors. Back-fill from the trunk: every head is an ordinary DENSE
     // block with the same width and head counts as layer 0.
+    // Only fill entries the generic reads left at zero. Those reads use hparams.n_layer(), which
+    // is n_layer_all - n_layer_nextn -- and n_layer_nextn was still 0 when they ran (it is read
+    // just above, by THIS function), so in practice they already covered all n_layer_all entries.
+    // Overwriting unconditionally would clobber genuine per-layer values in a checkpoint whose MTP
+    // blocks differ from layer 0.
     for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
-        hparams.n_ff_arr[il]      = hparams.n_ff_arr[0];
-        hparams.n_head_arr[il]    = hparams.n_head_arr[0];
-        hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[0];
+        if (hparams.n_ff_arr[il]      == 0) hparams.n_ff_arr[il]      = hparams.n_ff_arr[0];
+        if (hparams.n_head_arr[il]    == 0) hparams.n_head_arr[il]    = hparams.n_head_arr[0];
+        if (hparams.n_head_kv_arr[il] == 0) hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[0];
     }
 
     // NOTE: only trunk layers are marked recurrent. The MTP heads DO carry sconv state
