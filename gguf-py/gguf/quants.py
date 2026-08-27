@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os
+import tempfile
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Sequence
 from math import log2, ceil
@@ -25,6 +27,11 @@ def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizati
     return (*shape[:-1], shape[-1] // type_size * block_size)
 
 
+# Spill the output to a disk-backed buffer instead of RAM once it exceeds this many bytes.
+# Override with GGUF_SPILL_BYTES; 0 disables spilling and restores pure-RAM behaviour.
+_SPILL_BYTES = int(os.environ.get("GGUF_SPILL_BYTES", 8 << 30))
+
+
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
 def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.ndarray, otype: DTypeLike, oshape: tuple[int, ...]) -> np.ndarray:
     rows = arr.reshape((-1, arr.shape[-1]))
@@ -32,10 +39,43 @@ def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.n
     osize = 1
     for dim in oshape:
         osize *= dim
-    out = np.empty(shape=osize, dtype=otype)
     # compute over groups of 16 rows (arbitrary, but seems good for performance)
     n_groups = (rows.shape[0] // 16) or 1
-    np.concatenate([func(group).ravel() for group in np.array_split(rows, n_groups)], axis=0, out=out)
+
+    # The original body was:
+    #     out = np.empty(shape=osize, dtype=otype)
+    #     np.concatenate([func(g).ravel() for g in np.array_split(rows, n_groups)], axis=0, out=out)
+    # which peaks at TWICE the output tensor in RAM: `out` itself, plus the list comprehension,
+    # which np.concatenate fully materializes before consuming it. That caps the largest
+    # convertible tensor at roughly RAM/2 however carefully the caller streams its INPUT.
+    # Qwen3.8-Flash-Next's fused PLE table is 102.4 GB, so converting it to bf16 asked for
+    # 95.4 GiB from one np.empty and died on a 54 GiB machine -- after the model's own
+    # conversion class had gone to real trouble to keep the input side down to one shard.
+    #
+    # Two changes, both behaviour-preserving:
+    #   - write each group straight into its slice of `out`, so no intermediate list exists;
+    #   - back `out` with a temp file when it is large, so it costs disk rather than RAM.
+    # The temp is unlinked as soon as it is mapped, so the kernel reclaims the space when the
+    # mapping is dropped: nothing to clean up, and it never shows up as a stray file.
+    nbytes = osize * np.dtype(otype).itemsize
+    if _SPILL_BYTES and nbytes > _SPILL_BYTES:
+        spill_dir = os.environ.get("GGUF_SPILL_DIR") or tempfile.gettempdir()
+        fd, path = tempfile.mkstemp(suffix=".gguf-quant-spill", dir=spill_dir)
+        try:
+            os.close(fd)
+            out = np.memmap(path, dtype=otype, mode="w+", shape=(osize,))
+        finally:
+            os.unlink(path)
+    else:
+        out = np.empty(shape=osize, dtype=otype)
+
+    pos = 0
+    for group in np.array_split(rows, n_groups):
+        g = func(group).ravel()
+        out[pos:pos + g.size] = g
+        pos += g.size
+    assert pos == osize, f"grouped rows produced {pos} elements, expected {osize}"
+
     return out.reshape(oshape)
 
 
