@@ -3199,8 +3199,16 @@ private:
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
+                            // for recurrent memory, seq_pos_min() reports the TAIL (the last decoded
+                            // position), not the oldest position still held. Backing that off by the
+                            // SWA window yields a threshold no checkpoint can satisfy, so the cache is
+                            // rejected and the whole prompt is reprocessed every turn. Only pure-SWA
+                            // memory reports a genuine oldest-position that the back-off applies to.
+                            const bool pos_min_is_tail = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            const auto pos_min_thold = std::max(0, pos_next - (pos_min_is_tail ? 0 : n_swa) - (has_new_tokens ? 0 : 1));
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
