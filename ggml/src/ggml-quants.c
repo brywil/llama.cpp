@@ -2095,6 +2095,76 @@ static void quantize_row_q4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * G
     }
 }
 
+static void quantize_row_q2_0_impl(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
+    static_assert(QK2_0 == 64, "QK2_0 must be 64");
+
+    if (!quant_weights) {
+        quantize_row_q2_0_ref(x, y, n_per_row);
+        return;
+    }
+
+    float weight[QK2_0];
+    uint8_t L[QK2_0];
+    uint8_t best_L[QK2_0];
+
+    float sum_x2 = 0;
+    for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
+    float sigma2 = sum_x2/n_per_row;
+
+    const int64_t nb = n_per_row/QK2_0;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * xb = x + QK2_0 * ib;
+        const float * qw = quant_weights + QK2_0 * ib;
+        float amax = 0.0f;
+        for (int j = 0; j < QK2_0; ++j) {
+            const float ax = fabsf(xb[j]);
+            if (ax > amax) amax = ax;
+            weight[j] = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]);
+        }
+
+        float best_d = 0.0f;
+        float best_score = -1.0f;
+        memset(best_L, 0, sizeof(best_L));
+
+        if (amax > GROUP_MAX_EPS) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                for (int is = 0; is < 50; ++is) {
+                    const float d0 = sign * amax * (0.25f + 1.75f*is/49.0f);
+                    float id = 1.0f/d0;
+                    float sumlx = 0.0f;
+                    float suml2 = 0.0f;
+                    for (int j = 0; j < QK2_0; ++j) {
+                        int q = nearest_int(xb[j]*id) + 1;
+                        q = MAX(0, MIN(3, q));
+                        const int l = q - 1;
+                        L[j] = q;
+                        sumlx += weight[j]*xb[j]*l;
+                        suml2 += weight[j]*l*l;
+                    }
+                    if (suml2 <= 0.0f) {
+                        continue;
+                    }
+                    const float d = sumlx/suml2;
+                    const float score = d*sumlx;
+                    if (score > best_score) {
+                        best_score = score;
+                        best_d = d;
+                        memcpy(best_L, L, sizeof(best_L));
+                    }
+                }
+            }
+        }
+
+        y[ib].d = GGML_FP32_TO_FP16(best_d);
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        for (int j = 0; j < QK2_0; ++j) {
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            y[ib].qs[byte_index] |= (uint8_t)(best_L[j] << bit_offset);
+        }
+    }
+}
+
 size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q1_0_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -2118,7 +2188,7 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        quantize_row_q2_0_impl(src, (block_q2_0*)qrow, n_per_row, quant_weights);
         src += n_per_row;
         qrow += row_size;
     }
