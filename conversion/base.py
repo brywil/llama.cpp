@@ -485,11 +485,15 @@ class ModelBase:
             elif quant_method == "compressed-tensors":
                 quant_format = quant_config["format"]
                 groups = quant_config["config_groups"]
+                # "mixed-precision" covers both: (a) several groups that are all nvfp4-pack-quantized
+                # (the case this was originally written for), and (b) a genuine mix of an nvfp4 group
+                # plus a non-nvfp4 group (e.g. FP8 attention + NVFP4 experts) -- any() not all(), since
+                # the whole point of "mixed" is that not every group shares one format.
                 nvfp4_compressed_tensors = (
                     quant_format == "nvfp4-pack-quantized"
                     or quant_format == "mixed-precision"
                     and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                    and any(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
                 )
 
                 if len(groups) > 1 and not nvfp4_compressed_tensors:
@@ -538,8 +542,30 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
-                    pass
+                    # Pure NVFP4: nothing left to do here, _generate_nvfp4_tensors already
+                    # consumed everything.
+                    #
+                    # Genuine mixed-precision (e.g. FP8 attention + NVFP4 experts): by this point
+                    # _generate_nvfp4_tensors() (called before dequant_model()) has already consumed
+                    # every tensor with a 2D block scale (real NVFP4) and left 1D-per-channel-scale
+                    # tensors (e.g. FP8) untouched -- see its "Skip non-NVFP4 tensors" check. So any
+                    # ".weight_scale" tensor still present here belongs to a non-nvfp4 group; find
+                    # that group's config from `groups` (not the possibly-wrong group[0] grabbed
+                    # above) and dequantize the same way the single-group float-quantized case does.
+                    non_nvfp4_groups = [g for g in groups.values() if isinstance(g, dict)
+                                        and g.get("format") != "nvfp4-pack-quantized"]
+                    if non_nvfp4_groups:
+                        other_config = non_nvfp4_groups[0]["weights"]
+                        block_size = other_config.get("block_structure", None)
+                        for name in list(self.model_tensors.keys()):
+                            if name.endswith(".weight_scale"):
+                                weight_name = name.removesuffix("_scale")
+                                if weight_name not in self.model_tensors:
+                                    continue
+                                w = self.model_tensors[weight_name]
+                                s = self.model_tensors[name]
+                                self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), block_size)
+                                tensors_to_remove.append(name)
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
@@ -751,8 +777,12 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
-            if scale.ndim < 2:
+            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel scales). FP8's
+            # per-channel scale can be shaped [out_features, 1] -- technically
+            # 2D, but not actually block-structured -- so ndim alone can't
+            # distinguish it from a real NVFP4 per-block scale. A genuine
+            # NVFP4 block scale always has more than one block per row.
+            if scale.ndim < 2 or scale.shape[-1] <= 1:
                 continue
 
             scale2 = LazyTorchTensor.to_eager(self.model_tensors.get(scale2_name, lambda: torch.tensor(1.0))())
@@ -854,11 +884,14 @@ class ModelBase:
 
         # Some models use per-tensor quant_algo (e.g. "MIXED_PRECISION" with
         # per-layer NVFP4/FP8) instead of a single global "NVFP4" value.
+        # any() not all(): "mixed-precision" by definition may have some groups that aren't
+        # nvfp4-pack-quantized (e.g. an FP8 attention group alongside an NVFP4 expert group) --
+        # see the matching fix in dequant_model(), which handles dequantizing that other group.
         nvfp4_compressed_tensors = quant_method == "compressed-tensors" and (
             quant_format == "nvfp4-pack-quantized"
             or quant_format == "mixed-precision"
             and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            and any(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
         )
         if quant_algo != "NVFP4":
             if nvfp4_compressed_tensors:
