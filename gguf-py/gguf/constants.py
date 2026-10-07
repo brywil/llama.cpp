@@ -588,6 +588,7 @@ class MODEL_ARCH(IntEnum):
     DOTS3NOTE        = auto()
     ARCEE            = auto()
     AFMOE            = auto()
+    KOLIBRI1         = auto()
     LAGUNA           = auto()
     ERNIE4_5         = auto()
     ERNIE4_5_MOE     = auto()
@@ -1342,6 +1343,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DOTS3NOTE:        "dots3note",
     MODEL_ARCH.ARCEE:            "arcee",
     MODEL_ARCH.AFMOE:            "afmoe",
+    MODEL_ARCH.KOLIBRI1:         "kolibri1",
     MODEL_ARCH.LAGUNA:           "laguna",
     MODEL_ARCH.ERNIE4_5:         "ernie4_5",
     MODEL_ARCH.ERNIE4_5_MOE:     "ernie4_5-moe",
@@ -4605,6 +4607,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
+    MODEL_ARCH.KOLIBRI1: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+    ],
     MODEL_ARCH.AFMOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -5675,6 +5700,7 @@ class ExpertGatingFuncType(IntEnum):
     SOFTMAX       = 1
     SIGMOID       = 2
     SQRTSOFTPLUS  = 4
+    SIGMOID_LOGIT_BIAS = 5  # select top-k on logits + bias, weight by sigmoid(logits) (Kolibri 1)
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

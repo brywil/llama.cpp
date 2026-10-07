@@ -1618,6 +1618,10 @@ class TextModel(ModelBase):
         if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
+        if chkhsh == "6e040dfe72e4b85855588c53acf4909ac4e98e55bc3a33cd7db499180dc42a78":
+            # ref: https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16
+            # its regex is Qwen2's with \p{N}{1} for \p{N} (identical semantics)
+            res = "qwen2"
         if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
             # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
             res = "qwen35"

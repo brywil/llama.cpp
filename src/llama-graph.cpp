@@ -2043,6 +2043,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
             } break;
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_BIAS:
             {
                 probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
             } break;
@@ -2065,6 +2066,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    // Kolibri 1: the bias is added to the RAW logits for selection (not to sigmoid(logits) as in DeepSeek V3);
+    // the weights stay sigmoid(logits) of the selected experts, unbiased. Same set of experts only when the bias is
+    // zero, so using the DeepSeek path here would route differently while still producing plausible output.
+    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_BIAS) {
+        selection_probs = exp_probs_b ? ggml_add(ctx0, logits, exp_probs_b) : logits;
+        cb(selection_probs, "ffn_moe_logits_biased_sel", il);
     }
 
     // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
