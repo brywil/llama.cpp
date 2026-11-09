@@ -2751,8 +2751,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
-        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
-        res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
+        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft.
+        // LOCAL (bryan): 12x undercounts on the 5-layer Ripple-65B drafter (81 tensors,
+        // selector top_k 32 x block 16 + 5 ctx_other taps) -> ggml_backend_sched_reserve
+        // assertion. 48x fits with headroom; candidate upstream fix.
+        res = std::max<uint32_t>(4096u, 48u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
